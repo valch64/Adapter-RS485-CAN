@@ -251,7 +251,6 @@ void mcp2515_read_and_process() {
     uint8_t sidh = spi_rx_buf_dma[2];
     uint8_t sidl = spi_rx_buf_dma[3];
 
-    // --- ЗАЩИТА 1: Проверка на расширенный кадр (Extended Frame) ---
     // Бит 3 в sidl указывает, что кадр 29-битный. игнорируем.
     if ((sidl & 0x08) != 0) {
         mcp2515_modify_reg(MCP_CANINTF, 0x01, 0x00);
@@ -261,8 +260,7 @@ void mcp2515_read_and_process() {
     can_frame_t frame;
     frame.dlc = spi_rx_buf_dma[6] & 0x0F;
 
-    // --- ЗАЩИТА 2: Проверка длины данных (DLC) ---
-    // Пакеты от батареи (0x351, 0x356) всегда содержат 8 байт. Игнорируем огрызки.
+    // Игнорируем короткие кадры без полных данных
     if (frame.dlc < 6) {
         mcp2515_modify_reg(MCP_CANINTF, 0x01, 0x00);
         return;
@@ -291,8 +289,7 @@ void task_can_bus(void *pvParameters) {
         .max_transfer_sz = 32
     };
     spi_device_interface_config_t devcfg = {
-//        .clock_speed_hz = 10 * 1000 * 1000,
-        .clock_speed_hz = 2 * 1000 * 1000,
+        .clock_speed_hz = 2 * 1000 * 1000, // Снижено до 2 МГц для стабильности
         .mode = 0,
         .spics_io_num = PIN_NUM_CS,
         .queue_size = 7,
@@ -311,7 +308,7 @@ void task_can_bus(void *pvParameters) {
     TickType_t last_tx_time = 0;
     const TickType_t tx_interval = pdMS_TO_TICKS(1000);
     const uint8_t keep_alive_data[8] = {0};
-//Подписываем задачу на контроль
+//Подписка на Watchdog
     esp_task_wdt_add(NULL);
 
     while (1) {
@@ -485,7 +482,7 @@ void task_rs485_proxy(void *pvParameters) {
     int rx_idx = 0;
     char tx_buf[1024];
     BatteryState local_bat;
-//Подписываем задачу на контроль
+//Подписка на Watchdog
     esp_task_wdt_add(NULL);
 
     while (1) {
@@ -500,7 +497,7 @@ void task_rs485_proxy(void *pvParameters) {
 
             if (byte == EOI) {
                 rx_buf[rx_idx] = '\0';
-//                 ESP_LOGI(TAG_RS485, "RX: %s", rx_buf); // Раскомментируйте для дебага
+//                 ESP_LOGI(TAG_RS485, "RX: %s", rx_buf); // log
 
                 if (xSemaphoreTake(batMutex, portMAX_DELAY) == pdTRUE) {
                     memcpy(&local_bat, &bat, sizeof(BatteryState));
@@ -523,7 +520,7 @@ void task_rs485_proxy(void *pvParameters) {
 
                 if (handled) {
                     uart_write_bytes(SERIAL_PORT, tx_buf, strlen(tx_buf));
-//                     ESP_LOGI(TAG_RS485, "TX: %s", tx_buf); // Раскомментируйте для дебага
+//                     ESP_LOGI(TAG_RS485, "TX: %s", tx_buf); // Log
                 }
                 rx_idx = 0;
             }
@@ -683,7 +680,7 @@ void task_mqtt_publisher(void *pvParameters) {
 
     char json_payload[512];
     BatteryState local_bat;
-//Подписываем задачу на контроль
+//Подписка на Watchdog
     esp_task_wdt_add(NULL);
 
     while (1) {
