@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "esp_task_wdt.h"
@@ -25,7 +26,7 @@ static const char *TAG_MQTT = "MQTT_PUB";
 
 // --- НАСТРОЙКИ WI-FI И MQTT ---
 #define WIFI_SSID      "SSID"
-#define WIFI_PASS      "password"
+#define WIFI_PASS      "PASS"
 #define WIFI_MAX_RETRY 10
 
 #define MQTT_BROKER_URI "mqtt://192.168.1.100:1883"
@@ -40,6 +41,8 @@ static const char *TAG_MQTT = "MQTT_PUB";
 #define HA_DEVICE_DICT "\"device\":{\"identifiers\":[\"esp32_solar_bat\"],\"name\":\"Solar Battery\",\"manufacturer\":\"ESP32 Proxy\"}"
 
 static int s_retry_num = 0;
+static esp_timer_handle_t s_wifi_reconnect_timer;
+static volatile bool s_need_ha_discovery = false;
 
 // --- НАСТРОЙКИ ОБОРУДОВАНИЯ ---
 
@@ -99,19 +102,19 @@ typedef struct {
     uint16_t cell_max_module;
     uint16_t cell_min_module;
 
-    // Temp Info
-    uint16_t temp_cell_avg;
-    uint16_t temp_cell_max;
-    uint16_t temp_cell_min;
-    uint16_t temp_cell_max_module;
-    uint16_t temp_cell_min_module;
+    // Temp Info (0.1 °C, signed — бывают отрицательные)
+    int16_t  temp_cell_avg;
+    int16_t  temp_cell_max;
+    int16_t  temp_cell_min;
+    int16_t  temp_cell_max_module;
+    int16_t  temp_cell_min_module;
 
     // BMS Temp
-    uint16_t temp_bms_avg;
-    uint16_t temp_bms_max;
-    uint16_t temp_bms_min;
-    uint16_t temp_bms_max_module;
-    uint16_t temp_bms_min_module;
+    int16_t  temp_bms_avg;
+    int16_t  temp_bms_max;
+    int16_t  temp_bms_min;
+    int16_t  temp_bms_max_module;
+    int16_t  temp_bms_min_module;
 
     // 63H Data (Limits)
     uint32_t charge_vol_limit;    // mV
@@ -135,6 +138,25 @@ spi_device_handle_t spi;
 
 static uint8_t *spi_tx_buf_dma;
 static uint8_t *spi_rx_buf_dma;
+
+// SOC/SOH с CAN: 0–100 (%) или 0–1000 (0.1%). В RS485 уходит один байт 0–100.
+static uint8_t scale_percent(uint16_t raw) {
+    if (raw > 100) {
+        raw = (uint16_t)((raw + 5) / 10);
+    }
+    if (raw > 100) {
+        raw = 100;
+    }
+    return (uint8_t)raw;
+}
+
+// Pylontech 61H: 0.1 °C → 0.1 K, всегда 4 hex-цифры
+static uint16_t to_deci_kelvin(int16_t deci_c) {
+    int32_t k = (int32_t)deci_c + 2731;
+    if (k < 0) return 0;
+    if (k > 0xFFFF) return 0xFFFF;
+    return (uint16_t)k;
+}
 
 // ============================================================================
 //                                   ЧАСТЬ 1: ДРАЙВЕР CAN (MCP2515)
@@ -207,8 +229,8 @@ void update_battery_from_can(const can_frame_t *frame) {
                 break;
 
             case 0x355:
-                bat.soc     = (frame->data[1] << 8) | frame->data[0];
-                bat.avg_soh = (frame->data[3] << 8) | frame->data[2];
+                bat.soc     = scale_percent((uint16_t)((frame->data[1] << 8) | frame->data[0]));
+                bat.avg_soh = scale_percent((uint16_t)((frame->data[3] << 8) | frame->data[2]));
                 bat.min_soh = bat.avg_soh;
                 break;
 
@@ -279,6 +301,11 @@ void task_can_bus(void *pvParameters) {
 
     spi_tx_buf_dma = heap_caps_malloc(32, MALLOC_CAP_DMA);
     spi_rx_buf_dma = heap_caps_malloc(32, MALLOC_CAP_DMA);
+    if (!spi_tx_buf_dma || !spi_rx_buf_dma) {
+        ESP_LOGE(TAG_CAN, "DMA malloc failed");
+        vTaskDelete(NULL);
+        return;
+    }
 
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
@@ -314,9 +341,16 @@ void task_can_bus(void *pvParameters) {
     while (1) {
         esp_task_wdt_reset();
         uint8_t intf = mcp2515_read_reg(MCP_CANINTF);
+        uint8_t safety = 0;
         while ((intf & 0x01) != 0) {
+            esp_task_wdt_reset();
             mcp2515_read_and_process();
             intf = mcp2515_read_reg(MCP_CANINTF);
+            if (++safety >= 32) {
+                // Зависший RX0IF не должен крутить цикл до паники WDT
+                mcp2515_modify_reg(MCP_CANINTF, 0x01, 0x00);
+                break;
+            }
         }
 
         TickType_t now = xTaskGetTickCount();
@@ -358,8 +392,8 @@ void calculate_and_append_chksum(char* buffer) {
 void get_response_63H(char* output_buffer, size_t buf_size, const BatteryState* state) {
     char info_data[128];
     snprintf(info_data, sizeof(info_data), "%04lX%04lX%04X%04X%02X",
-             state->charge_vol_limit,
-             state->discharge_vol_limit,
+             (unsigned long)state->charge_vol_limit,
+             (unsigned long)state->discharge_vol_limit,
              (uint16_t)state->max_chg_current,
              (uint16_t)state->max_dis_current,
              state->status);
@@ -380,8 +414,8 @@ void get_response_63H(char* output_buffer, size_t buf_size, const BatteryState* 
 void get_response_92H(char* output_buffer, size_t buf_size, const BatteryState* state) {
     char info_data[128];
     snprintf(info_data, sizeof(info_data), "02%04lX%04lX%04X%04X%02X",
-             state->charge_vol_limit,
-             state->discharge_vol_limit,
+             (unsigned long)state->charge_vol_limit,
+             (unsigned long)state->discharge_vol_limit,
              (uint16_t)state->max_chg_current,
              (uint16_t)state->max_dis_current,
              state->status);
@@ -430,21 +464,21 @@ void get_response_61H(char* output_buffer, size_t buf_size, const BatteryState* 
              state->cell_min_module,
 
 // --- ПЕРЕВОДИМ 0.1 °C В 0.1 KELVIN ---
-             state->temp_cell_avg + 2731,
-             state->temp_cell_max + 2731,
-             state->temp_cell_max_module + 2731,
-             state->temp_cell_min + 2731,
-             state->temp_cell_min_module + 2731,
-             state->temp_cell_avg + 2731,
-             state->temp_cell_max + 2731,
-             state->temp_cell_max_module + 2731,
-             state->temp_cell_min + 2731,
-             state->temp_cell_min_module + 2731,
-             state->temp_bms_avg + 2731,
-             state->temp_bms_max + 2731,
-             state->temp_bms_max_module + 2731,
-             state->temp_bms_min + 2731,
-             state->temp_bms_min_module + 2731
+             to_deci_kelvin(state->temp_cell_avg),
+             to_deci_kelvin(state->temp_cell_max),
+             to_deci_kelvin(state->temp_cell_max_module),
+             to_deci_kelvin(state->temp_cell_min),
+             to_deci_kelvin(state->temp_cell_min_module),
+             to_deci_kelvin(state->temp_cell_avg),
+             to_deci_kelvin(state->temp_cell_max),
+             to_deci_kelvin(state->temp_cell_max_module),
+             to_deci_kelvin(state->temp_cell_min),
+             to_deci_kelvin(state->temp_cell_min_module),
+             to_deci_kelvin(state->temp_bms_avg),
+             to_deci_kelvin(state->temp_bms_max),
+             to_deci_kelvin(state->temp_bms_max_module),
+             to_deci_kelvin(state->temp_bms_min),
+             to_deci_kelvin(state->temp_bms_min_module)
             );
 
     int info_len = strlen(info_data);
@@ -490,7 +524,7 @@ void task_rs485_proxy(void *pvParameters) {
 // Сброс таймера
         esp_task_wdt_reset();
         uint8_t byte;
-        int len = uart_read_bytes(SERIAL_PORT, &byte, 1, 10 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(SERIAL_PORT, &byte, 1, pdMS_TO_TICKS(10));
         if (len > 0) {
             if (byte == SOI) rx_idx = 0;
             if (rx_idx < 1023) rx_buf[rx_idx++] = byte;
@@ -498,6 +532,12 @@ void task_rs485_proxy(void *pvParameters) {
             if (byte == EOI) {
                 rx_buf[rx_idx] = '\0';
 //                 ESP_LOGI(TAG_RS485, "RX: %s", rx_buf); // log
+
+                // Минимальный кадр: ~VER ADR CID1 CID2 (9 байт до CID2 включительно)
+                if (rx_idx < 9) {
+                    rx_idx = 0;
+                    continue;
+                }
 
                 if (xSemaphoreTake(batMutex, portMAX_DELAY) == pdTRUE) {
                     memcpy(&local_bat, &bat, sizeof(BatteryState));
@@ -532,25 +572,37 @@ void task_rs485_proxy(void *pvParameters) {
 //                                   ЧАСТЬ 3: WI-FI И MQTT
 // ============================================================================
 
+static void wifi_reconnect_timer_cb(void *arg) {
+    (void)arg;
+    s_retry_num = 0;
+    ESP_LOGI(TAG_WIFI, "Повторная попытка Wi-Fi после паузы");
+    esp_wifi_connect();
+}
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+
         if (s_retry_num < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
             ESP_LOGW(TAG_WIFI, "Попытка переподключения к Wi-Fi (%d/%d)...", s_retry_num, WIFI_MAX_RETRY);
         } else {
-            ESP_LOGE(TAG_WIFI, "Не удалось подключиться к Wi-Fi. Ждем...");
-            vTaskDelay(pdMS_TO_TICKS(30000));
-            s_retry_num = 0;
-            esp_wifi_connect();
+            ESP_LOGE(TAG_WIFI, "Не удалось подключиться к Wi-Fi. Пауза 30 с...");
+            if (s_wifi_reconnect_timer) {
+                esp_timer_stop(s_wifi_reconnect_timer);
+                esp_timer_start_once(s_wifi_reconnect_timer, 30ULL * 1000 * 1000);
+            }
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG_WIFI, "Wi-Fi подключен! IP адрес: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
+        if (s_wifi_reconnect_timer) {
+            esp_timer_stop(s_wifi_reconnect_timer);
+        }
     }
 }
 
@@ -558,6 +610,12 @@ void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = &wifi_reconnect_timer_cb,
+        .name = "wifi_reconnect"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &s_wifi_reconnect_timer));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -642,17 +700,20 @@ static void publish_ha_discovery(esp_mqtt_client_handle_t client) {
         );
 
         esp_mqtt_client_publish(client, topic, payload, 0, 1, 1);
+        esp_task_wdt_reset();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     ESP_LOGI(TAG_MQTT, "HA Discovery messages published!");
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
-    esp_mqtt_event_handle_t event = event_data;
+    (void)handler_args;
+    (void)base;
     switch ((esp_mqtt_event_id_t)event_id) {
         case MQTT_EVENT_CONNECTED:
             ESP_LOGI(TAG_MQTT, "MQTT Connected");
-            publish_ha_discovery(event->client);
+            // Только флаг: publish + delay нельзя делать из MQTT event handler
+            s_need_ha_discovery = true;
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG_MQTT, "MQTT Disconnected");
@@ -683,44 +744,56 @@ void task_mqtt_publisher(void *pvParameters) {
 //Подписка на Watchdog
     esp_task_wdt_add(NULL);
 
-    while (1) {
-        //Сброс таймера
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(5000));
+    TickType_t last_pub = 0;
 
-        if (xSemaphoreTake(batMutex, portMAX_DELAY) == pdTRUE) {
-            memcpy(&local_bat, &bat, sizeof(BatteryState));
-            xSemaphoreGive(batMutex);
+    while (1) {
+        esp_task_wdt_reset();
+
+        if (s_need_ha_discovery) {
+            s_need_ha_discovery = false;
+            publish_ha_discovery(client);
         }
 
-        snprintf(json_payload, sizeof(json_payload),
-            "{"
-            "\"voltage\":%.2f,"
-            "\"current\":%.1f,"
-            "\"soc\":%d,"
-            "\"soh\":%d,"
-            "\"cell_max_mv\":%d,"
-            "\"cell_min_mv\":%d,"
-            "\"temp_avg_c\":%.1f,"
-            "\"lim_chg_v\":%.2f,"
-            "\"lim_dis_v\":%.2f,"
-            "\"max_chg_a\":%.1f,"
-            "\"max_dis_a\":%.1f"
-            "}",
-            local_bat.voltage / 100.0,
-            -(local_bat.current / 10.0),
-            local_bat.soc,
-            local_bat.avg_soh,
-            local_bat.cell_max,
-            local_bat.cell_min,
-            local_bat.temp_cell_avg / 10.0,
-            local_bat.charge_vol_limit / 1000.0,
-            local_bat.discharge_vol_limit / 1000.0,
-            local_bat.max_chg_current / 10.0,
-            abs(local_bat.max_dis_current) / 10.0
-        );
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_pub) >= pdMS_TO_TICKS(5000)) {
+            last_pub = now;
 
-        esp_mqtt_client_publish(client, MQTT_TOPIC, json_payload, 0, 0, 0);
+            if (xSemaphoreTake(batMutex, portMAX_DELAY) == pdTRUE) {
+                memcpy(&local_bat, &bat, sizeof(BatteryState));
+                xSemaphoreGive(batMutex);
+            }
+
+            snprintf(json_payload, sizeof(json_payload),
+                "{"
+                "\"voltage\":%.2f,"
+                "\"current\":%.1f,"
+                "\"soc\":%d,"
+                "\"soh\":%d,"
+                "\"cell_max_mv\":%d,"
+                "\"cell_min_mv\":%d,"
+                "\"temp_avg_c\":%.1f,"
+                "\"lim_chg_v\":%.2f,"
+                "\"lim_dis_v\":%.2f,"
+                "\"max_chg_a\":%.1f,"
+                "\"max_dis_a\":%.1f"
+                "}",
+                local_bat.voltage / 100.0,
+                -(local_bat.current / 10.0),
+                local_bat.soc,
+                local_bat.avg_soh,
+                local_bat.cell_max,
+                local_bat.cell_min,
+                local_bat.temp_cell_avg / 10.0,
+                local_bat.charge_vol_limit / 1000.0,
+                local_bat.discharge_vol_limit / 1000.0,
+                local_bat.max_chg_current / 10.0,
+                abs(local_bat.max_dis_current) / 10.0
+            );
+
+            esp_mqtt_client_publish(client, MQTT_TOPIC, json_payload, 0, 0, 0);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -763,9 +836,9 @@ void app_main() {
 
     // Первоочередной запуск критически важных задач (инвертор не будет ждать сеть)
     xTaskCreatePinnedToCore(task_can_bus, "CAN_TASK", 4096, NULL, 5, NULL, 1);
-    xTaskCreatePinnedToCore(task_rs485_proxy, "RS485_TASK", 4096, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(task_rs485_proxy, "RS485_TASK", 8192, NULL, 5, NULL, 0);
 
     // Фоновая инициализация сетевой инфраструктуры
     wifi_init_sta();
-    xTaskCreatePinnedToCore(task_mqtt_publisher, "MQTT_TASK", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(task_mqtt_publisher, "MQTT_TASK", 6144, NULL, 4, NULL, 0);
 }
